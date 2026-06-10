@@ -1,93 +1,70 @@
 # ternary-bloom-filter
 
-Ternary Bloom filter for GPU-accelerable membership testing. {-1,0,+1} weighted bits allow boost/block/neutral membership. 16x denser than FP32.
+Ternary Bloom filter with {-1, 0, +1} weighted bits for membership and exclusion testing.
 
-## Why This Matters
+## Why This Exists
 
-# ternary-bloom-filter
-Ternary Bloom filter: {-1,0,+1} weighted bits for GPU membership testing.
-Positive bits boost membership, negative bits block it.
+A standard Bloom filter answers "probably in set" or "definitely not in set." But in some workloads you also need "definitely excluded" — a stronger negative signal. A ternary Bloom filter extends each bit to a ternary counter: positive bits boost membership confidence, negative bits actively block it. Items inserted as "negative" act as a permanent exclusion list. This gives you both a membership filter and a blocklist in one data structure, GPU-packable as `Vec<u32>`.
 
-## The Five-Layer Stack
+## Architecture
 
-This crate is part of the **Oxide Stack** — a distributed GPU runtime built on five layers:
+### Core Types
 
-```
-┌─────────────────┐
-│  cudaclaw        │  Persistent GPU kernels, warp consensus, SmartCRDT
-├─────────────────┤
-│  cuda-oxide      │  Flux → MIR → Pliron → NVVM → PTX compiler
-├─────────────────┤
-│  flux-core       │  Bytecode VM + A2A agent protocol
-├─────────────────┤
-│  pincher         │  "Vector DB as runtime, LLM as compiler"
-├─────────────────┤
-│  open-parallel   │  Async runtime (tokio fork)
-└─────────────────┘
-```
+- **`TernaryBloom`** — Array of `i8` counters, each hash function maps to a position.
+  - `insert_positive`: Increment counters → boosts membership signal.
+  - `insert_negative`: Decrement counters → creates exclusion signal.
+  - `check`: Sum of all hash positions → positive means likely member, negative means likely blocked, zero means unknown.
 
-The key insight: **ternary values {-1, 0, +1} map directly to GPU compute**. They pack 16× denser than FP32, enable XNOR+popcount matmul, and conservation laws become compile-time checks.
+### GPU Packing
 
-## Design
-
-Every value in this crate follows **ternary algebra** (Z₃):
-
-| Value | Meaning | GPU Analog |
-|-------|---------|------------|
-| +1 | Positive / Active / Healthy | Warp vote yes |
-| 0 | Neutral / Pending / Balanced | Warp vote abstain |
-| -1 | Negative / Failed / Overloaded | Warp vote no |
-
-This isn't arbitrary — ternary is the natural encoding for:
-1. **BitNet b1.58** (Microsoft) — ternary LLMs at 60% less power
-2. **GPU warp voting** — hardware ballot returns ternary consensus
-3. **Conservation laws** — {-1, 0, +1} preserves quantity
-
-## Key Types
-
-```rust
-pub struct TernaryBloom
-pub fn new
-pub fn insert_positive
-pub fn insert_negative
-pub fn check
-pub fn contains
-pub fn blocked
-pub fn merge
-pub fn pack_for_gpu
-pub fn positive_count
-pub fn negative_count
-pub fn fill_rate
-```
+`pack_for_gpu()` converts the i8 array into a packed u32 representation for GPU upload.
 
 ## Usage
 
-```toml
-[dependencies]
-ternary-bloom-filter = "0.1.0"
-```
-
 ```rust
-use ternary_bloom_filter::*;
-// See src/lib.rs tests for complete working examples
+use ternary_bloom_filter::TernaryBloom;
+
+let mut filter = TernaryBloom::new(3); // 3 hash functions
+
+// Insert allowed kernels
+filter.insert_positive(b"matmul");
+filter.insert_positive(b"conv2d");
+filter.insert_positive(b"layernorm");
+
+// Block dangerous kernels
+filter.insert_negative(b"eval");  // never execute
+filter.insert_negative(b"shell");
+
+// Query
+assert!(filter.contains(b"matmul"));        // positive signal
+assert!(filter.blocked(b"eval"));            // negative signal
+assert_eq!(filter.check(b"unknown"), 0);     // neutral
+
+// Pack for GPU upload
+let gpu_data: Vec<u32> = filter.pack_for_gpu();
 ```
 
-## Testing
+## API Reference
 
-```bash
-git clone https://github.com/SuperInstance/ternary-bloom-filter.git
-cd ternary-bloom-filter
-cargo test    # 8 tests
-```
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `new(hash_count)` | `TernaryBloom` | Create filter with N hash functions |
+| `insert_positive(item)` | `()` | Boost item's membership signal |
+| `insert_negative(item)` | `()` | Block item's membership signal |
+| `check(item)` | `i32` | Sum of hash positions (>0 member, <0 blocked) |
+| `contains(item)` | `bool` | Check > 0 |
+| `blocked(item)` | `bool` | Check < 0 |
+| `merge(other)` | `()` | Merge another filter into this one |
+| `pack_for_gpu()` | `Vec<u32>` | Pack i8 array to u32 for GPU upload |
+| `positive_count()` / `negative_count()` | `u64` | Insertion counters |
+| `fill_rate()` | `f64` | Fraction of non-zero positions |
 
-## Stats
+## The Deeper Idea
 
-| Metric | Value |
-|--------|-------|
-| Tests | 8 |
-| Lines of Rust | 151 |
-| Public API | 12 items |
+The ternary Bloom filter is a **soft firewall**. Traditional firewalls are binary (allow/deny). Traditional Bloom filters are positive-only (in-set/not-in-set). A ternary Bloom filter combines both: it can simultaneously track "these are good" and "these are bad" with a single query. The neutral state (score = 0) means "no evidence either way," which is the correct default for security-sensitive systems — you don't want to accidentally allow something you haven't explicitly reviewed.
 
-## License
+## Related Crates
 
-Apache-2.0
+- **ternary-sketch** — Count-Min sketch with ternary counters
+- **ternary-search-index** — ternary-weighted document search
+- **ternary-pack** — bit-packing ternary values into u32
