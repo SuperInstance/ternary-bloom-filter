@@ -1,70 +1,119 @@
-# ternary-bloom-filter
+# Ternary Bloom Filter
 
-Ternary Bloom filter with {-1, 0, +1} weighted bits for membership and exclusion testing.
+**Ternary Bloom Filter** is a GPU-accelerable membership testing data structure using {-1, 0, +1} weighted bits — positive bits boost membership confidence, negative bits block it, and zero bits are neutral. This provides 16× memory density over FP32 Bloom filters.
 
-## Why This Exists
+## Why It Matters
 
-A standard Bloom filter answers "probably in set" or "definitely not in set." But in some workloads you also need "definitely excluded" — a stronger negative signal. A ternary Bloom filter extends each bit to a ternary counter: positive bits boost membership confidence, negative bits actively block it. Items inserted as "negative" act as a permanent exclusion list. This gives you both a membership filter and a blocklist in one data structure, GPU-packable as `Vec<u32>`.
+Standard Bloom filters answer "is this item in the set?" with true/probably-false. They can't answer "is this item explicitly excluded?" Ternary Bloom filters can — negative insertions mark items as blocked, and queries return a signed confidence score rather than a boolean. This enables blocklist+allowlist filtering in a single data structure, critical for fleet access control where both inclusion and exclusion matter simultaneously.
 
-## Architecture
+## How It Works
 
-### Core Types
+### Standard Bloom Filter Refresher
 
-- **`TernaryBloom`** — Array of `i8` counters, each hash function maps to a position.
-  - `insert_positive`: Increment counters → boosts membership signal.
-  - `insert_negative`: Decrement counters → creates exclusion signal.
-  - `check`: Sum of all hash positions → positive means likely member, negative means likely blocked, zero means unknown.
+A Bloom filter uses k hash functions to map items to positions in a bit array:
 
-### GPU Packing
+```
+insert(item):
+    for i in 0..k:
+        bits[hash_i(item)] = 1
 
-`pack_for_gpu()` converts the i8 array into a packed u32 representation for GPU upload.
+check(item):
+    return AND(bits[hash_i(item)] for i in 0..k)
+```
 
-## Usage
+False positive rate: (1 - e^(-kn/m))^k for n items, m bits, k hashes.
+
+### Ternary Extension
+
+Instead of bits {0, 1}, the array uses trits {-1, 0, +1}:
+
+```
+insert_positive(item):
+    for i in 0..k: bits[hash_i(item)] = +1
+
+insert_negative(item):
+    for i in 0..k: bits[hash_i(item)] = -1
+
+check(item) → Σ bits[hash_i(item)] for i in 0..k
+    score > 0: probably in positive set
+    score < 0: probably in negative set
+    score = 0: not in either set (or conflicting)
+```
+
+Hash function: `h(data, seed) = (seed · 31 + Σ byte) mod m`. Cost: **O(L + k)** where L = data length.
+
+### False Positive Rate
+
+With n+ items in the positive set and n- in the negative set:
+
+```
+P(false positive) ≈ (1 - e^(-k·n+/m))^k
+```
+
+The negative set doesn't increase false positives (it adds true negatives). But conflicts (same hash position for + and - items) increase uncertainty — the check returns 0 instead of ±k.
+
+### Memory Density
+
+```
+FP32 Bloom:  32 bits per slot
+Binary Bloom: 1 bit per slot
+Ternary Bloom: 2 bits per slot (encodes -1, 0, +1)
+
+Density vs FP32: 32/2 = 16×
+Density vs binary: 1/2 = 0.5× (half as dense, but signed!)
+```
+
+### Merge Operation
+
+```rust
+merge(other):
+    for (a, b) in bits.iter_mut().zip(other.bits):
+        if b != 0 && a == 0: a = b   // adopt non-zero
+        if a == b: continue           // agree
+        // Conflicting: keep existing (conservative)
+```
+
+Merge: **O(m)** where m = filter size.
+
+## Quick Start
 
 ```rust
 use ternary_bloom_filter::TernaryBloom;
 
 let mut filter = TernaryBloom::new(3); // 3 hash functions
 
-// Insert allowed kernels
-filter.insert_positive(b"matmul");
-filter.insert_positive(b"conv2d");
-filter.insert_positive(b"layernorm");
+filter.insert_positive(b"trusted_agent");
+filter.insert_negative(b"banned_agent");
 
-// Block dangerous kernels
-filter.insert_negative(b"eval");  // never execute
-filter.insert_negative(b"shell");
-
-// Query
-assert!(filter.contains(b"matmul"));        // positive signal
-assert!(filter.blocked(b"eval"));            // negative signal
-assert_eq!(filter.check(b"unknown"), 0);     // neutral
-
-// Pack for GPU upload
-let gpu_data: Vec<u32> = filter.pack_for_gpu();
+assert!(filter.contains(b"trusted_agent"));   // true (score > 0)
+assert!(filter.blocked(b"banned_agent"));     // true (score < 0)
+assert!(!filter.contains(b"unknown"));        // false (score = 0)
 ```
 
-## API Reference
+## API
 
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `new(hash_count)` | `TernaryBloom` | Create filter with N hash functions |
-| `insert_positive(item)` | `()` | Boost item's membership signal |
-| `insert_negative(item)` | `()` | Block item's membership signal |
-| `check(item)` | `i32` | Sum of hash positions (>0 member, <0 blocked) |
-| `contains(item)` | `bool` | Check > 0 |
-| `blocked(item)` | `bool` | Check < 0 |
-| `merge(other)` | `()` | Merge another filter into this one |
-| `pack_for_gpu()` | `Vec<u32>` | Pack i8 array to u32 for GPU upload |
-| `positive_count()` / `negative_count()` | `u64` | Insertion counters |
-| `fill_rate()` | `f64` | Fraction of non-zero positions |
+| Type | Description |
+|------|-------------|
+| `TernaryBloom` | Vec<i8> of {-1, 0, +1} with k hash functions |
+| `insert_positive(item)` | Boost membership for item |
+| `insert_negative(item)` | Block membership for item |
+| `check(item) → i32` | Signed confidence score |
+| `contains(item) → bool` | True if check > 0 |
+| `blocked(item) → bool` | True if check < 0 |
+| `merge(other)` | Merge two filters (conservative) |
 
-## The Deeper Idea
+## Architecture Notes
 
-The ternary Bloom filter is a **soft firewall**. Traditional firewalls are binary (allow/deny). Traditional Bloom filters are positive-only (in-set/not-in-set). A ternary Bloom filter combines both: it can simultaneously track "these are good" and "these are bad" with a single query. The neutral state (score = 0) means "no evidence either way," which is the correct default for security-sensitive systems — you don't want to accidentally allow something you haven't explicitly reviewed.
+Ternary Bloom Filter provides GPU-accelerable membership testing for fleet access control in SuperInstance. In γ + η = C, positive insertions represent γ (growth — adding trusted agents to the allowlist) while negative insertions represent η (avoidance — blocking hostile agents via the blocklist). The signed check score naturally encodes the γ - η difference. The 2-bit encoding is compatible with GPU ternary packing from `ternary-benchmark`.
 
-## Related Crates
+See [ARCHITECTURE.md](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md) for fleet security architecture.
 
-- **ternary-sketch** — Count-Min sketch with ternary counters
-- **ternary-search-index** — ternary-weighted document search
-- **ternary-pack** — bit-packing ternary values into u32
+## References
+
+1. Bloom, B. H. (1970). "Space/Time Trade-offs in Hash Coding with Allowable Errors." *Communications of the ACM*, 13(7), 422–426.
+2. Fan, B. et al. (2014). "Cuckoo Filter: Practically Better Than Bloom." *Proceedings of the 10th ACM International on Conference on Emerging Networking Experiments and Technologies*.
+3. Mitzenmacher, M. & Upfal, E. (2017). *Probability and Computing*, 2nd ed. Cambridge University Press.
+
+## License
+
+Apache-2.0
